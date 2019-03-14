@@ -1,0 +1,7 @@
+.distignore
+.editorconfig
+.gitignore
+composer*
+phpcs.xml
+vendor*
+README.md
