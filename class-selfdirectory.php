@@ -4,7 +4,7 @@ defined( 'ABSPATH' ) || exit;
 
 if ( ! class_exists( 'SelfDirectory' ) ) {
 	final class SelfDirectory {
-		public $version = '1.0.1';
+		public $version = '1.0.2';
 
 		protected static $_instance = null;
 
@@ -83,7 +83,7 @@ if ( ! class_exists( 'SelfDirectory' ) ) {
 
 				$response = (object) json_decode( wp_remote_retrieve_body( $raw_response ), true );
 				$latest   = (object) $response->latest;
-				if ( version_compare( $plugin['Version'], $latest->version ) ) {
+				if ( version_compare( $plugin['Version'], $latest->version ) < 0 ) {
 					$basename = plugin_basename( $file );
 
 					$value->response[ $basename ] = (object) array(
