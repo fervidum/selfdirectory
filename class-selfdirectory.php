@@ -4,7 +4,7 @@ defined( 'ABSPATH' ) || exit;
 
 if ( ! class_exists( 'SelfDirectory' ) ) {
 	final class SelfDirectory {
-		public $version = '1.0.0';
+		public $version = '1.0.1';
 
 		protected static $_instance = null;
 
@@ -76,22 +76,23 @@ if ( ! class_exists( 'SelfDirectory' ) ) {
 				if ( $ssl && is_wp_error( $raw_response ) ) {
 					$raw_response = wp_remote_get( $http_url );
 				}
-				if (
-					is_wp_error( $raw_response )
-					||
-					200 != wp_remote_retrieve_response_code( $raw_response ) ) {
+				$response_code = (int) wp_remote_retrieve_response_code( $raw_response );
+				if ( is_wp_error( $raw_response ) || 200 !== $response_code ) {
 					return $value;
 				}
 
-				$releases = (object) json_decode( wp_remote_retrieve_body( $raw_response ), true );
-				$latest   = (object) $releases->latest;
+				$response = (object) json_decode( wp_remote_retrieve_body( $raw_response ), true );
+				$latest   = (object) $response->latest;
 				if ( version_compare( $plugin['Version'], $latest->version ) ) {
 					$basename = plugin_basename( $file );
 
 					$value->response[ $basename ] = (object) array(
-						'new_version' => $latest->version,
-						'package'     => $latest->package,
-						'tested'      => '5.1.1',
+						'slug'         => $response->slug,
+						'new_version'  => $latest->version,
+						'package'      => $latest->package,
+						'requires'     => $latest->requires,
+						'tested'       => $latest->tested,
+						'requires_php' => $latest->requires_php,
 					);
 				}
 			}
