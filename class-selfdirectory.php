@@ -3,13 +3,57 @@
 defined( 'ABSPATH' ) || exit;
 
 if ( ! class_exists( 'SelfDirectory' ) ) {
+	/**
+	 * Self-hosted plugin update checker.
+	 *
+	 * Registers plugins for update checking against a self-hosted source.
+	 * Supports the GitHub Releases API (preferred) and a legacy wp.json manifest.
+	 *
+	 * Usage — add to the plugin main file:
+	 *
+	 *   require_once __DIR__ . '/lib/selfdirectory/class-selfdirectory.php';
+	 *   add_action( 'selfd_register', function () { selfd( __FILE__ ); } );
+	 *
+	 * The plugin file must declare a `Directory:` header (or fall back to
+	 * `Plugin URI:`) pointing to either:
+	 *   - A GitHub repository URL  (https://github.com/owner/repo)  → GitHub API
+	 *   - Any other URL serving a wp.json manifest                   → legacy
+	 *
+	 * @package SelfDirectory
+	 * @since   1.0.0
+	 */
 	final class SelfDirectory {
-		public $version = '1.0.2';
 
+		/**
+		 * Library version.
+		 *
+		 * @since 1.0.0
+		 * @var   string
+		 */
+		public $version = '1.2.0';
+
+		/**
+		 * Singleton instance.
+		 *
+		 * @since 1.0.0
+		 * @var   static|null
+		 */
 		protected static $_instance = null;
 
+		/**
+		 * Absolute paths to plugin files registered for update checking.
+		 *
+		 * @since 1.0.0
+		 * @var   string[]
+		 */
 		public $files = array();
 
+		/**
+		 * Return the singleton instance, creating it on first call.
+		 *
+		 * @since  1.0.0
+		 * @return static
+		 */
 		public static function instance() {
 			if ( is_null( self::$_instance ) ) {
 				self::$_instance = new self();
@@ -17,10 +61,28 @@ if ( ! class_exists( 'SelfDirectory' ) ) {
 			return self::$_instance;
 		}
 
+		/**
+		 * Bootstrap: defers initialisation to the `init` hook so that
+		 * plugin headers and filters are fully loaded before we attach.
+		 *
+		 * @since 1.0.0
+		 */
 		public function __construct() {
 			add_action( 'init', array( $this, 'init' ) );
 		}
 
+		/**
+		 * Attach WordPress hooks when the updater should be active.
+		 *
+		 * By default only runs in the admin context (excluding AJAX).
+		 * Override via the `selfd_load` filter to change when updates are checked:
+		 *
+		 *   // Always run (e.g. for REST or CLI consumers):
+		 *   add_filter( 'selfd_load', '__return_true' );
+		 *
+		 * @since  1.0.0
+		 * @return void
+		 */
 		public function init() {
 			if ( true !== apply_filters( 'selfd_load', ( is_admin() && ! defined( 'DOING_AJAX' ) ) ) ) {
 				return;
@@ -35,72 +97,478 @@ if ( ! class_exists( 'SelfDirectory' ) ) {
 			do_action( 'selfd_register' );
 		}
 
+		/**
+		 * Register a plugin file for update checking.
+		 *
+		 * Called inside `selfd_register` action handlers via the {@see selfd()} helper:
+		 *
+		 *   add_action( 'selfd_register', function () { selfd( __FILE__ ); } );
+		 *
+		 * @since  1.0.0
+		 * @param  string $file Absolute path to the plugin's main PHP file.
+		 * @return void
+		 */
 		public function register( $file ) {
 			$this->files[] = $file;
 		}
 
+		/**
+		 * Expose the custom `Directory:` plugin file header to WordPress.
+		 *
+		 * WordPress ignores unknown headers unless they are declared via
+		 * `extra_plugin_headers`. Without this filter, `get_plugin_data()`
+		 * would silently drop the `Directory:` value.
+		 *
+		 * @since  1.0.0
+		 * @param  string[] $extra_headers Currently registered extra headers.
+		 * @return string[]
+		 */
 		public function directory_header( $extra_headers ) {
 			$extra_headers[] = 'Directory';
 			return $extra_headers;
 		}
 
-		public static function get_plugin_source( $plugin_file ) {
-			$directory = '';
-			if ( file_exists( $plugin_file ) ) {
-				$data = get_plugin_data( $plugin_file, false, false );
-
-				$data['Directory'] = esc_url( $data['Directory'] );
-				if ( $data['Directory'] ) {
-					$directory  = untrailingslashit( $data['Directory'] );
-					$directory .= '/wp.json';
-				}
+		/**
+		 * Parse a github.com URL into owner and repo components.
+		 *
+		 * Accepts URLs with or without trailing path segments — only the first
+		 * two path segments (owner/repo) are used.
+		 *
+		 * @since  1.1.0
+		 * @param  string $url e.g. https://github.com/owner/repo
+		 * @return array{owner:string,repo:string}|null  Null when $url is not a valid github.com URL.
+		 */
+		protected function parse_github_url( $url ) {
+			$parsed = wp_parse_url( $url );
+			if ( empty( $parsed['host'] ) || 'github.com' !== $parsed['host'] ) {
+				return null;
 			}
-			return $directory;
+
+			$parts = explode( '/', trim( $parsed['path'] ?? '', '/' ) );
+			if ( count( $parts ) < 2 || '' === $parts[0] || '' === $parts[1] ) {
+				return null;
+			}
+
+			return array( 'owner' => $parts[0], 'repo' => $parts[1] );
 		}
 
-		public function update_plugins( $value ) {
-			foreach ( $this->files as $file ) {
-				$plugin = get_plugin_data( $file, false, false );
-				$source = self::get_plugin_source( $file );
-				if ( ! $source ) {
-					return $value;
-				}
+		/**
+		 * Fetch all published releases for a GitHub repository, newest first.
+		 *
+		 * Drafts and pre-releases are filtered out. Results are stored in a
+		 * WordPress transient:
+		 *   - Success → cached for 12 hours.
+		 *   - Failure → negative-cached for 1 hour to avoid hammering the API
+		 *               on every admin page load when the repo has no releases.
+		 *
+		 * @since  1.1.0
+		 * @param  string   $owner GitHub repository owner (user or organisation).
+		 * @param  string   $repo  GitHub repository name.
+		 * @return array[]|null    Indexed array of release objects (newest first), or null on failure.
+		 */
+		protected function get_github_releases( $owner, $repo ) {
+			$cache_key = 'selfd_releases_' . md5( "{$owner}/{$repo}" );
+			$cached    = get_transient( $cache_key );
 
-				$http_url = $source;
-				$url      = $http_url;
-				$ssl      = wp_http_supports( array( 'ssl' ) );
-				if ( $ssl ) {
-					$url = set_url_scheme( $url, 'https' );
-				}
-				$raw_response = wp_remote_get( $url );
-				if ( $ssl && is_wp_error( $raw_response ) ) {
-					$raw_response = wp_remote_get( $http_url );
-				}
-				$response_code = (int) wp_remote_retrieve_response_code( $raw_response );
-				if ( is_wp_error( $raw_response ) || 200 !== $response_code ) {
-					return $value;
-				}
+			if ( false !== $cached ) {
+				return is_array( $cached ) ? $cached : null;
+			}
 
-				$response = (object) json_decode( wp_remote_retrieve_body( $raw_response ), true );
-				$latest   = (object) $response->latest;
-				if ( version_compare( $plugin['Version'], $latest->version ) < 0 ) {
-					$basename = plugin_basename( $file );
+			$response = wp_remote_get(
+				"https://api.github.com/repos/{$owner}/{$repo}/releases",
+				array(
+					'headers' => array(
+						'Accept'     => 'application/vnd.github+json',
+						'User-Agent' => 'SelfDirectory/1.2.0 WordPress/' . get_bloginfo( 'version' ),
+					),
+					'timeout' => 10,
+				)
+			);
 
-					$value->response[ $basename ] = (object) array(
-						'slug'         => $response->slug,
-						'new_version'  => $latest->version,
-						'package'      => $latest->package,
-						'requires'     => $latest->requires,
-						'tested'       => $latest->tested,
-						'requires_php' => $latest->requires_php,
+			if ( is_wp_error( $response ) || 200 !== (int) wp_remote_retrieve_response_code( $response ) ) {
+				set_transient( $cache_key, 0, HOUR_IN_SECONDS );
+				return null;
+			}
+
+			$all = json_decode( wp_remote_retrieve_body( $response ), true );
+			if ( empty( $all ) || ! is_array( $all ) ) {
+				set_transient( $cache_key, 0, HOUR_IN_SECONDS );
+				return null;
+			}
+
+			// GitHub returns releases newest-first; keep only published ones.
+			$releases = array_values(
+				array_filter( $all, function ( $r ) {
+					return ! $r['draft'] && ! $r['prerelease'];
+				} )
+			);
+
+			if ( empty( $releases ) ) {
+				set_transient( $cache_key, 0, HOUR_IN_SECONDS );
+				return null;
+			}
+
+			set_transient( $cache_key, $releases, 12 * HOUR_IN_SECONDS );
+			return $releases;
+		}
+
+		/**
+		 * Read plugin headers from the main plugin file at a specific Git tag.
+		 *
+		 * Fetches the raw file from raw.githubusercontent.com and extracts
+		 * `Requires at least`, `Tested up to`, and `Requires PHP` via regex,
+		 * mirroring what WordPress does with get_plugin_data() locally.
+		 *
+		 * Cached indefinitely — a Git tag's content is immutable, so there
+		 * is no value in ever re-fetching the same tag/file combination.
+		 *
+		 * @since  1.1.0
+		 * @param  string $owner           GitHub owner.
+		 * @param  string $repo            GitHub repository name.
+		 * @param  string $tag             Tag name, e.g. "0.2.0" or "v0.2.0".
+		 * @param  string $plugin_basename Filename of the main plugin file, e.g. "axellcore.php".
+		 * @return array{requires:string,tested:string,requires_php:string}
+		 */
+		protected function get_remote_plugin_headers( $owner, $repo, $tag, $plugin_basename ) {
+			$cache_key = 'selfd_headers_' . md5( "{$owner}/{$repo}/{$tag}/{$plugin_basename}" );
+			$cached    = get_transient( $cache_key );
+
+			if ( is_array( $cached ) ) {
+				return $cached;
+			}
+
+			$response = wp_remote_get(
+				"https://raw.githubusercontent.com/{$owner}/{$repo}/{$tag}/{$plugin_basename}",
+				array(
+					'headers' => array(
+						'User-Agent' => 'SelfDirectory/1.2.0 WordPress/' . get_bloginfo( 'version' ),
+					),
+					'timeout' => 10,
+				)
+			);
+
+			$headers = array( 'requires' => '', 'tested' => '', 'requires_php' => '' );
+
+			if ( ! is_wp_error( $response ) && 200 === (int) wp_remote_retrieve_response_code( $response ) ) {
+				$content = wp_remote_retrieve_body( $response );
+				$map     = array(
+					'requires'     => 'Requires at least',
+					'tested'       => 'Tested up to',
+					'requires_php' => 'Requires PHP',
+				);
+				foreach ( $map as $key => $label ) {
+					if ( preg_match( '/' . preg_quote( $label, '/' ) . ':\s*(\S+)/i', $content, $m ) ) {
+						$headers[ $key ] = $m[1];
+					}
+				}
+			}
+
+			set_transient( $cache_key, $headers, 0 ); // 0 = no expiry.
+			return $headers;
+		}
+
+		/**
+		 * Build update info by querying the GitHub Releases API.
+		 *
+		 * Fetches all published releases (newest first) and treats the first as
+		 * "latest". Builds a complete `versions` map (version → package URL) from
+		 * the full release list, enabling rollback via plugins such as WP Rollback.
+		 *
+		 * Asset resolution per release (in order):
+		 *   1. First `.zip` file attached to the release assets.
+		 *   2. GitHub-generated source zipball (`zipball_url`) as fallback.
+		 *
+		 * The `v` prefix is stripped from tag names so that tags like "v0.2.0"
+		 * and plugin headers like "Version: 0.2.0" compare as equal.
+		 *
+		 * @since  1.1.0
+		 * @param  string                          $file Absolute path to the plugin main file.
+		 * @param  array{owner:string,repo:string} $gh   Parsed GitHub repo components.
+		 * @return array{slug:string,version:string,package:string,requires:string,tested:string,requires_php:string,versions:array<string,array{version:string,package:string}>}|null
+		 */
+		protected function get_update_via_github( $file, $gh ) {
+			$releases = $this->get_github_releases( $gh['owner'], $gh['repo'] );
+			if ( ! $releases ) {
+				return null;
+			}
+
+			$latest = $releases[0]; // Newest published release.
+			$tag    = $latest['tag_name'];
+
+			// Build version → update-object map from all releases.
+			// Headers (requires/tested/requires_php) are only fetched for the latest
+			// tag to avoid N extra API calls for older releases.
+			$versions = array();
+			foreach ( $releases as $release ) {
+				$v   = ltrim( $release['tag_name'], 'v' );
+				$pkg = null;
+				if ( ! empty( $release['assets'] ) ) {
+					foreach ( $release['assets'] as $asset ) {
+						if ( isset( $asset['name'] ) && str_ends_with( $asset['name'], '.zip' ) ) {
+							$pkg = $asset['browser_download_url'];
+							break;
+						}
+					}
+				}
+				if ( ! $pkg ) {
+					$pkg = $release['zipball_url'] ?? null;
+				}
+				if ( $pkg ) {
+					$versions[ $v ] = array(
+						'version' => $v,
+						'package' => $pkg,
 					);
 				}
 			}
+
+			$version = ltrim( $tag, 'v' );
+			$package = $versions[ $version ] ?? null;
+			if ( ! $package ) {
+				return null;
+			}
+
+			$headers = $this->get_remote_plugin_headers(
+				$gh['owner'],
+				$gh['repo'],
+				$tag,
+				basename( $file )
+			);
+
+			return array_merge(
+				array(
+					'slug'     => $gh['repo'],
+					'version'  => $version,
+					'package'  => $package,
+					'versions' => $versions,
+				),
+				$headers
+			);
+		}
+
+		/**
+		 * Legacy: build update info by fetching a wp.json manifest.
+		 *
+		 * Used when the resolved directory URL is not a github.com URL.
+		 * Expected manifest format:
+		 *
+		 *   {
+		 *     "slug": "my-plugin",
+		 *     "latest": {
+		 *       "version":      "1.2.0",
+		 *       "package":      "https://example.com/my-plugin-1.2.0.zip",
+		 *       "requires":     "6.4",
+		 *       "tested":       "6.8",
+		 *       "requires_php": "8.1"
+		 *     },
+		 *     "versions": {
+		 *       "1.2.0": {
+		 *         "version":      "1.2.0",
+		 *         "package":      "https://example.com/my-plugin-1.2.0.zip",
+		 *         "requires":     "6.4",
+		 *         "tested":       "6.8",
+		 *         "requires_php": "8.1"
+		 *       },
+		 *       "1.1.0": {
+		 *         "version":      "1.1.0",
+		 *         "package":      "https://example.com/my-plugin-1.1.0.zip",
+		 *         "requires":     "6.4",
+		 *         "tested":       "6.7",
+		 *         "requires_php": "8.1"
+		 *       }
+		 *     }
+		 *   }
+		 *
+		 * Each entry in `versions` mirrors the `latest` structure. The map is
+		 * optional but recommended for rollback support (e.g. via WP Rollback).
+		 * When absent, an empty array is returned.
+		 *
+		 * SSL is attempted first; falls back to plain HTTP if the SSL request
+		 * fails and the site supports SSL (matching WordPress core behaviour).
+		 *
+		 * @since  1.0.0
+		 * @param  string $wp_json_url Full URL to the wp.json manifest.
+		 * @return array{slug:string,version:string,package:string,requires:string,tested:string,requires_php:string,versions:array<string,array<string,string>>}|null
+		 */
+		protected function get_update_via_wp_json( $wp_json_url ) {
+			$ssl      = wp_http_supports( array( 'ssl' ) );
+			$url      = $ssl ? set_url_scheme( $wp_json_url, 'https' ) : $wp_json_url;
+			$response = wp_remote_get( $url );
+
+			if ( $ssl && is_wp_error( $response ) ) {
+				$response = wp_remote_get( $wp_json_url );
+			}
+
+			if ( is_wp_error( $response ) || 200 !== (int) wp_remote_retrieve_response_code( $response ) ) {
+				return null;
+			}
+
+			$data   = json_decode( wp_remote_retrieve_body( $response ), true );
+			$latest = $data['latest'] ?? null;
+			if ( ! $latest || empty( $latest['version'] ) ) {
+				return null;
+			}
+
+			return array(
+				'slug'         => $data['slug'] ?? '',
+				'version'      => $latest['version'],
+				'package'      => $latest['package'] ?? '',
+				'requires'     => $latest['requires'] ?? '',
+				'tested'       => $latest['tested'] ?? '',
+				'requires_php' => $latest['requires_php'] ?? '',
+				'versions'     => $data['versions'] ?? array(),
+			);
+		}
+
+		/**
+		 * Inject update data into the WordPress plugin update transient.
+		 *
+		 * Hooked on `pre_set_site_transient_update_plugins`. For each registered
+		 * plugin file, the update source URL is resolved in order:
+		 *
+		 *   1. `Directory:` plugin header  (explicit, preferred)
+		 *   2. `Plugin URI:` header        (fallback when Directory is absent)
+		 *
+		 * The resolved URL is then classified:
+		 *   - github.com URL → {@see get_update_via_github()} (Releases API)
+		 *   - anything else  → {@see get_update_via_wp_json()} at {url}/wp.json
+		 *
+		 * @since  1.0.0
+		 * @param  object $value The `update_plugins` site transient value.
+		 * @return object
+		 */
+		public function update_plugins( $value ) {
+			foreach ( $this->files as $file ) {
+				if ( ! file_exists( $file ) ) {
+					continue;
+				}
+
+				$plugin_data = get_plugin_data( $file, false, false );
+
+				// Prefer the explicit Directory header; fall back to Plugin URI.
+				$directory = esc_url( $plugin_data['Directory'] ?? '' );
+				if ( ! $directory ) {
+					$directory = esc_url( $plugin_data['PluginURI'] ?? '' );
+				}
+				if ( ! $directory ) {
+					continue;
+				}
+
+				$gh = $this->parse_github_url( $directory );
+
+				if ( $gh ) {
+					$update = $this->get_update_via_github( $file, $gh );
+				} else {
+					$update = $this->get_update_via_wp_json( untrailingslashit( $directory ) . '/wp.json' );
+				}
+
+				if ( ! $update || empty( $update['version'] ) ) {
+					continue;
+				}
+
+				$basename = plugin_basename( $file );
+
+				if ( version_compare( $plugin_data['Version'], $update['version'] ) < 0 ) {
+					$value->response[ $basename ] = (object) array(
+						'slug'         => $update['slug'] ?? dirname( $basename ),
+						'new_version'  => $update['version'],
+						'package'      => $update['package'] ?? '',
+						'requires'     => $update['requires'] ?? '',
+						'tested'       => $update['tested'] ?? '',
+						'requires_php' => $update['requires_php'] ?? '',
+						'versions'     => $update['versions'] ?? array(),
+					);
+				}
+
+				// Language packs — independent of whether the plugin itself needs an update.
+				if ( $gh ) {
+					$this->inject_language_packs( $value, $basename, $gh );
+				}
+			}
+
 			return $value;
+		}
+
+		/**
+		 * Inject language pack update entries into the WordPress update transient.
+		 *
+		 * Scans GitHub release assets for files matching `{repo}-{locale}.zip`
+		 * (where locale is e.g. `pt_BR`) and adds them to `$value->translations`
+		 * so that WordPress can download and install them via the admin panel.
+		 *
+		 * Only assets from the newest release that contains a given locale are used.
+		 * A pack is only injected when no translation is installed or the pack's
+		 * publication timestamp is newer than the installed translation's revision date.
+		 *
+		 * @since  1.2.0
+		 * @param  object                          $value    The `update_plugins` site transient.
+		 * @param  string                          $basename Plugin basename, e.g. `axellcore/axellcore.php`.
+		 * @param  array{owner:string,repo:string} $gh       Parsed GitHub repo components.
+		 * @return void
+		 */
+		protected function inject_language_packs( $value, $basename, $gh ) {
+			$releases = $this->get_github_releases( $gh['owner'], $gh['repo'] );
+			if ( ! $releases ) {
+				return;
+			}
+
+			$slug   = dirname( $basename ); // plugin folder name, e.g. "axellcore"
+			$pattern = '/^' . preg_quote( $gh['repo'], '/' ) . '-([a-z]{2,3}_[A-Z]{2,4})\.zip$/';
+			$packs   = array(); // locale => pack data (newest release wins)
+
+			foreach ( $releases as $release ) {
+				if ( empty( $release['assets'] ) ) {
+					continue;
+				}
+				foreach ( $release['assets'] as $asset ) {
+					if ( ! preg_match( $pattern, $asset['name'] ?? '', $m ) ) {
+						continue;
+					}
+					$locale = $m[1];
+					if ( isset( $packs[ $locale ] ) ) {
+						continue; // releases are newest-first; first match wins.
+					}
+					$packs[ $locale ] = array(
+						'type'       => 'plugin',
+						'slug'       => $slug,
+						'language'   => $locale,
+						'version'    => ltrim( $release['tag_name'], 'v' ),
+						'updated'    => gmdate( 'Y-m-d H:i:s', strtotime( $release['published_at'] ) ),
+						'package'    => $asset['browser_download_url'],
+						'autoupdate' => true,
+					);
+				}
+			}
+
+			if ( empty( $packs ) ) {
+				return;
+			}
+
+			$installed = wp_get_installed_translations( 'plugins' )[ $slug ] ?? array();
+
+			if ( ! isset( $value->translations ) || ! is_array( $value->translations ) ) {
+				$value->translations = array();
+			}
+
+			foreach ( $packs as $locale => $pack ) {
+				$revision = $installed[ $locale ]['PO-Revision-Date'] ?? '';
+				if ( $revision && strtotime( $revision ) >= strtotime( $pack['updated'] ) ) {
+					continue; // already up-to-date.
+				}
+				$value->translations[] = $pack;
+			}
 		}
 	}
 
 	if ( ! function_exists( 'load_self_directory' ) ) {
+		/**
+		 * Instantiate the SelfDirectory singleton and store it in $GLOBALS.
+		 *
+		 * Attached to `plugins_loaded` or called immediately when that hook
+		 * has already fired (e.g. when this file is required late).
+		 *
+		 * @since  1.0.0
+		 * @return void
+		 */
 		function load_self_directory() {
 			$GLOBALS['selfd'] = SelfDirectory::instance();
 		}
@@ -114,9 +582,20 @@ if ( ! class_exists( 'SelfDirectory' ) ) {
 }
 
 if ( ! function_exists( 'selfd' ) ) {
+	/**
+	 * Register a plugin file with SelfDirectory for update checking.
+	 *
+	 * Convenience wrapper around {@see SelfDirectory::register()}.
+	 * Must be called inside a `selfd_register` action callback:
+	 *
+	 *   add_action( 'selfd_register', function () { selfd( __FILE__ ); } );
+	 *
+	 * @since  1.0.0
+	 * @param  string $file Absolute path to the plugin's main PHP file.
+	 * @return void
+	 */
 	function selfd( $file ) {
 		$instance = call_user_func( array( get_class( $GLOBALS['selfd'] ), 'instance' ) );
-
 		call_user_func( array( $instance, 'register' ), $file );
 	}
 }
