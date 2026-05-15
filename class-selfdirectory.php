@@ -84,17 +84,27 @@ if ( ! class_exists( 'SelfDirectory' ) ) {
 		 * @return void
 		 */
 		public function init() {
-			if ( true !== apply_filters( 'selfd_load', ( is_admin() && ! defined( 'DOING_AJAX' ) ) ) ) {
+			$should_load = is_admin()
+				|| ( defined( 'DOING_CRON' ) && DOING_CRON )
+				|| ( defined( 'DOING_AJAX' ) && DOING_AJAX && isset( $_POST['action'] ) && in_array( $_POST['action'], [ 'update-plugin', 'install-plugin', 'update-selected' ], true ) )
+				|| wp_doing_cron();
+
+			$should_load = apply_filters( 'selfd_load', $should_load );
+
+			// Always register plugins so translations_api works in all contexts.
+			foreach ( array( 'plugin' ) as $context ) {
+				add_filter( "extra_{$context}_headers", array( $this, 'directory_header' ) );
+			}
+			do_action( 'selfd_register' );
+
+			// translations_api runs in all contexts (WP-CLI, REST, cron, admin).
+			add_filter( 'translations_api', array( $this, 'translations_api' ), 10, 3 );
+
+			if ( true !== $should_load ) {
 				return;
 			}
 
 			add_filter( 'pre_set_site_transient_update_plugins', array( $this, 'update_plugins' ) );
-
-			foreach ( array( 'plugin' ) as $context ) {
-				add_filter( "extra_{$context}_headers", array( $this, 'directory_header' ) );
-			}
-
-			do_action( 'selfd_register' );
 		}
 
 		/**
@@ -298,13 +308,19 @@ if ( ! class_exists( 'SelfDirectory' ) ) {
 			// Build version → update-object map from all releases.
 			// Headers (requires/tested/requires_php) are only fetched for the latest
 			// tag to avoid N extra API calls for older releases.
+			// Pattern that matches language pack assets ({repo}.{version}-{locale}.zip)
+			// — excluded from plugin zip resolution.
+			$lang_pattern = '/^' . preg_quote( $gh['repo'], '/' ) . '\.[^-]+-[a-z]{2,3}_[A-Z]{2,4}\.zip$/';
+
 			$versions = array();
 			foreach ( $releases as $release ) {
 				$v   = ltrim( $release['tag_name'], 'v' );
 				$pkg = null;
 				if ( ! empty( $release['assets'] ) ) {
 					foreach ( $release['assets'] as $asset ) {
-						if ( isset( $asset['name'] ) && str_ends_with( $asset['name'], '.zip' ) ) {
+						$name = $asset['name'] ?? '';
+						// Skip language pack zips — only pick the plugin zip.
+						if ( str_ends_with( $name, '.zip' ) && ! preg_match( $lang_pattern, $name ) ) {
 							$pkg = $asset['browser_download_url'];
 							break;
 						}
@@ -321,11 +337,12 @@ if ( ! class_exists( 'SelfDirectory' ) ) {
 				}
 			}
 
-			$version = ltrim( $tag, 'v' );
-			$package = $versions[ $version ] ?? null;
-			if ( ! $package ) {
+			$version     = ltrim( $tag, 'v' );
+			$version_obj = $versions[ $version ] ?? null;
+			if ( ! $version_obj ) {
 				return null;
 			}
+			$package = $version_obj['package'];
 
 			$headers = $this->get_remote_plugin_headers(
 				$gh['owner'],
@@ -461,25 +478,39 @@ if ( ! class_exists( 'SelfDirectory' ) ) {
 					$update = $this->get_update_via_wp_json( untrailingslashit( $directory ) . '/wp.json' );
 				}
 
-				if ( ! $update || empty( $update['version'] ) ) {
-					continue;
-				}
-
 				$basename = plugin_basename( $file );
 
-				if ( version_compare( $plugin_data['Version'], $update['version'] ) < 0 ) {
-					$value->response[ $basename ] = (object) array(
-						'slug'         => $update['slug'] ?? dirname( $basename ),
-						'new_version'  => $update['version'],
-						'package'      => $update['package'] ?? '',
-						'requires'     => $update['requires'] ?? '',
-						'tested'       => $update['tested'] ?? '',
-						'requires_php' => $update['requires_php'] ?? '',
-						'versions'     => $update['versions'] ?? array(),
-					);
+				if ( $update && ! empty( $update['version'] ) ) {
+					if ( version_compare( $plugin_data['Version'], $update['version'] ) < 0 ) {
+						// Newer version available — add to update response.
+						$value->response[ $basename ] = (object) array(
+							'slug'         => $update['slug'] ?? dirname( $basename ),
+							'new_version'  => $update['version'],
+							'package'      => $update['package'] ?? '',
+							'requires'     => $update['requires'] ?? '',
+							'tested'       => $update['tested'] ?? '',
+							'requires_php' => $update['requires_php'] ?? '',
+							'versions'     => $update['versions'] ?? array(),
+						);
+					} elseif ( ! isset( $value->response[ $basename ] ) ) {
+						// Plugin is up-to-date — register in no_update so WordPress
+						// knows the plugin exists and can offer language pack installs.
+						if ( ! isset( $value->no_update ) ) {
+							$value->no_update = array();
+						}
+						$value->no_update[ $basename ] = (object) array(
+							'slug'         => $update['slug'] ?? dirname( $basename ),
+							'new_version'  => $update['version'],
+							'package'      => '',
+							'requires'     => $update['requires'] ?? '',
+							'tested'       => $update['tested'] ?? '',
+							'requires_php' => $update['requires_php'] ?? '',
+							'versions'     => $update['versions'] ?? array(),
+						);
+					}
 				}
 
-				// Language packs — independent of whether the plugin itself needs an update.
+				// Language packs — always injected regardless of plugin update status.
 				if ( $gh ) {
 					$this->inject_language_packs( $value, $basename, $gh );
 				}
@@ -491,7 +522,7 @@ if ( ! class_exists( 'SelfDirectory' ) ) {
 		/**
 		 * Inject language pack update entries into the WordPress update transient.
 		 *
-		 * Scans GitHub release assets for files matching `{repo}-{locale}.zip`
+		 * Scans GitHub release assets for files matching `{repo}.{version}-{locale}.zip`
 		 * (where locale is e.g. `pt_BR`) and adds them to `$value->translations`
 		 * so that WordPress can download and install them via the admin panel.
 		 *
@@ -512,7 +543,8 @@ if ( ! class_exists( 'SelfDirectory' ) ) {
 			}
 
 			$slug   = dirname( $basename ); // plugin folder name, e.g. "axellcore"
-			$pattern = '/^' . preg_quote( $gh['repo'], '/' ) . '-([a-z]{2,3}_[A-Z]{2,4})\.zip$/';
+			// Asset name format: {repo}.{version}-{locale}.zip
+			$pattern = '/^' . preg_quote( $gh['repo'], '/' ) . '\.[^-]+-([a-z]{2,3}_[A-Z]{2,4})\.zip$/';
 			$packs   = array(); // locale => pack data (newest release wins)
 
 			foreach ( $releases as $release ) {
@@ -535,6 +567,8 @@ if ( ! class_exists( 'SelfDirectory' ) ) {
 						'updated'    => gmdate( 'Y-m-d H:i:s', strtotime( $release['published_at'] ) ),
 						'package'    => $asset['browser_download_url'],
 						'autoupdate' => true,
+						'requires_php' => '',
+						'requires'   => '',
 					);
 				}
 			}
@@ -556,6 +590,88 @@ if ( ! class_exists( 'SelfDirectory' ) ) {
 				}
 				$value->translations[] = $pack;
 			}
+		}
+
+		/**
+		 * Intercept translations_api() for registered plugins.
+		 *
+		 * Hooked on `translations_api` (runs in all contexts including WP-CLI).
+		 * Returns available language packs from GitHub releases so that
+		 * `wp language plugin install <slug> <locale>` works for self-hosted plugins.
+		 *
+		 * @since  1.2.0
+		 * @param  false|array $result  Preemptive result; false = let WordPress proceed.
+		 * @param  string      $type    API type: 'plugins', 'themes', or 'core'.
+		 * @param  object      $args    Request args including slug and version.
+		 * @return false|array
+		 */
+		public function translations_api( $result, $type, $args ) {
+			if ( 'plugins' !== $type ) {
+				return $result;
+			}
+
+			$slug = is_object( $args ) ? ( $args->slug ?? '' ) : ( $args['slug'] ?? '' );
+			if ( ! $slug ) {
+				return $result;
+			}
+
+			// Find the registered file matching this slug.
+			$file = null;
+			foreach ( $this->files as $f ) {
+				if ( dirname( plugin_basename( $f ) ) === $slug ) {
+					$file = $f;
+					break;
+				}
+			}
+			if ( ! $file ) {
+				return $result;
+			}
+
+			$plugin_data = get_plugin_data( $file, false, false );
+			$directory   = esc_url( $plugin_data['Directory'] ?? '' ) ?: esc_url( $plugin_data['PluginURI'] ?? '' );
+			$gh          = $directory ? $this->parse_github_url( $directory ) : null;
+			if ( ! $gh ) {
+				return $result;
+			}
+
+			$releases = $this->get_github_releases( $gh['owner'], $gh['repo'] );
+			if ( ! $releases ) {
+				return $result;
+			}
+
+			$pattern      = '/^' . preg_quote( $gh['repo'], '/' ) . '\.[^-]+-([a-z]{2,3}_[A-Z]{2,4})\.zip$/';
+			$translations = array();
+
+			foreach ( $releases as $release ) {
+				if ( empty( $release['assets'] ) ) {
+					continue;
+				}
+				foreach ( $release['assets'] as $asset ) {
+					if ( ! preg_match( $pattern, $asset['name'] ?? '', $m ) ) {
+						continue;
+					}
+					$locale = $m[1];
+					// Newest release wins per locale.
+					if ( isset( $translations[ $locale ] ) ) {
+						continue;
+					}
+					$translations[ $locale ] = array(
+						'type'     => 'plugin',
+						'slug'     => $slug,
+						'language' => $locale,
+						'version'  => ltrim( $release['tag_name'], 'v' ),
+						'updated'  => gmdate( 'Y-m-d H:i:s', strtotime( $release['published_at'] ) ),
+						'package'  => $asset['browser_download_url'],
+						'autoupdate' => true,
+					);
+				}
+			}
+
+			if ( empty( $translations ) ) {
+				return $result;
+			}
+
+			return array( 'translations' => array_values( $translations ) );
 		}
 	}
 
