@@ -19,6 +19,34 @@ git submodule add https://github.com/fervidum/selfdirectory lib/selfdirectory
 
 Commit both `.gitmodules` and `lib/selfdirectory` to your repository.
 
+### Updating the submodule
+
+To pull the latest version of SelfDirectory into your plugin:
+
+```bash
+git submodule update --remote lib/selfdirectory
+git add lib/selfdirectory
+git commit -m "chore: update selfdirectory to latest"
+```
+
+`--remote` fetches the tracking branch (`master` by default) and advances the pointer. Without it, `git submodule update` only checks out the SHA already recorded in your repository — it will not pull new commits.
+
+To pin to a specific commit instead of always tracking the tip:
+
+```bash
+cd lib/selfdirectory
+git checkout <sha-or-tag>
+cd ../..
+git add lib/selfdirectory
+git commit -m "chore: pin selfdirectory to <sha-or-tag>"
+```
+
+After cloning a repository that uses SelfDirectory as a submodule, initialise it with:
+
+```bash
+git submodule update --init --recursive
+```
+
 ---
 
 ## Plugin setup
