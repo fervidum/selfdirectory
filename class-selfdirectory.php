@@ -123,7 +123,9 @@ if ( ! class_exists( 'SelfDirectory' ) ) {
 		 * @return void
 		 */
 		public function register( $file ) {
-			$this->files[] = $file;
+			if ( ! in_array( $file, $this->files, true ) ) {
+				$this->files[] = $file;
+			}
 		}
 
 		/**
@@ -546,33 +548,53 @@ if ( ! class_exists( 'SelfDirectory' ) ) {
 				return;
 			}
 
-			$slug   = dirname( $basename ); // plugin folder name, e.g. "axellcore"
+			$slug = dirname( $basename ); // plugin folder name, e.g. "axellcore"
+
+			// Resolve the currently installed plugin version.
+			$plugin_file = '';
+			foreach ( $this->files as $f ) {
+				if ( plugin_basename( $f ) === $basename ) {
+					$plugin_file = $f;
+					break;
+				}
+			}
+			$plugin_data       = $plugin_file ? get_plugin_data( $plugin_file, false, false ) : array();
+			$installed_version = $plugin_data['Version'] ?? '';
+
 			// Asset name format: {repo}.{version}-{locale}.zip
-			$pattern = '/^' . preg_quote( $gh['repo'], '/' ) . '\.[^-]+-([a-z]{2,3}_[A-Z]{2,4})\.zip$/';
-			$packs   = array(); // locale => pack data (newest release wins)
+			$pattern = '/^' . preg_quote( $gh['repo'], '/' ) . '\.([^-]+)-([a-z]{2,3}_[A-Z]{2,4})\.zip$/';
+			$packs   = array(); // locale => pack data
 
 			foreach ( $releases as $release ) {
 				if ( empty( $release['assets'] ) ) {
 					continue;
 				}
+				$release_version = ltrim( $release['tag_name'], 'v' );
 				foreach ( $release['assets'] as $asset ) {
 					if ( ! preg_match( $pattern, $asset['name'] ?? '', $m ) ) {
 						continue;
 					}
-					$locale = $m[1];
+					$asset_version = $m[1];
+					$locale        = $m[2];
+
+					// Only offer the pack that matches the installed plugin version.
+					if ( $installed_version && $asset_version !== $installed_version ) {
+						continue;
+					}
+
 					if ( isset( $packs[ $locale ] ) ) {
 						continue; // releases are newest-first; first match wins.
 					}
 					$packs[ $locale ] = array(
-						'type'       => 'plugin',
-						'slug'       => $slug,
-						'language'   => $locale,
-						'version'    => ltrim( $release['tag_name'], 'v' ),
-						'updated'    => gmdate( 'Y-m-d H:i:s', strtotime( $release['published_at'] ) ),
-						'package'    => $asset['browser_download_url'],
-						'autoupdate' => true,
+						'type'         => 'plugin',
+						'slug'         => $slug,
+						'language'     => $locale,
+						'version'      => $release_version,
+						'updated'      => gmdate( 'Y-m-d H:i:s', strtotime( $release['published_at'] ) ),
+						'package'      => $asset['browser_download_url'],
+						'autoupdate'   => true,
 						'requires_php' => '',
-						'requires'   => '',
+						'requires'     => '',
 					);
 				}
 			}
@@ -581,17 +603,43 @@ if ( ! class_exists( 'SelfDirectory' ) ) {
 				return;
 			}
 
-			$installed = wp_get_installed_translations( 'plugins' )[ $slug ] ?? array();
+			$installed_translations = wp_get_installed_translations( 'plugins' )[ $slug ] ?? array();
 
 			if ( ! isset( $value->translations ) || ! is_array( $value->translations ) ) {
 				$value->translations = array();
 			}
 
-			foreach ( $packs as $locale => $pack ) {
-				$revision = $installed[ $locale ]['PO-Revision-Date'] ?? '';
-				if ( $revision && strtotime( $revision ) >= strtotime( $pack['updated'] ) ) {
-					continue; // already up-to-date.
+			// Build a set of slugs already in $value->translations to avoid duplicates.
+			$already = array();
+			foreach ( $value->translations as $existing ) {
+				if ( ( $existing['slug'] ?? '' ) === $slug ) {
+					$already[] = $existing['language'] ?? '';
 				}
+			}
+
+			foreach ( $packs as $locale => $pack ) {
+				// Skip if already queued.
+				if ( in_array( $locale, $already, true ) ) {
+					continue;
+				}
+
+				$tr = $installed_translations[ $locale ] ?? array();
+
+				// Skip if the installed translation already covers this plugin version.
+				// Project-Id-Version is e.g. "Axell Core 0.2.3" — extract the trailing version.
+				$id_version = $tr['Project-Id-Version'] ?? '';
+				if ( $id_version && preg_match( '/([0-9]+\.[0-9]+\.[0-9]+)$/', $id_version, $vm ) ) {
+					if ( $vm[1] === $pack['version'] ) {
+						continue; // same version already installed.
+					}
+				}
+
+				// Fallback: skip if PO-Revision-Date is newer than the pack's publish date.
+				$revision = $tr['PO-Revision-Date'] ?? '';
+				if ( $revision && strtotime( $revision ) >= strtotime( $pack['updated'] ) ) {
+					continue;
+				}
+
 				$value->translations[] = $pack;
 			}
 		}
