@@ -109,6 +109,7 @@ if ( ! class_exists( 'SelfDirectory' ) ) {
 			}
 
 			add_filter( 'pre_set_site_transient_update_plugins', array( $this, 'update_plugins' ) );
+			add_action( 'upgrader_process_complete', array( $this, 'auto_install_language_packs' ), 10, 2 );
 		}
 
 		/**
@@ -440,6 +441,115 @@ if ( ! class_exists( 'SelfDirectory' ) ) {
 				'requires_php' => $latest['requires_php'] ?? '',
 				'versions'     => $data['versions'] ?? array(),
 			);
+		}
+
+		/**
+		 * Automatically install language packs after a plugin is installed or updated.
+		 *
+		 * Hooked on `upgrader_process_complete`. Fires when any plugin is installed
+		 * or updated via the admin UI (zip upload, plugin screen update, auto-update).
+		 * For each registered file that was affected, fetches available language packs
+		 * from GitHub releases and installs them immediately — no manual visit to
+		 * Dashboard → Updates required.
+		 *
+		 * @since 1.2.1
+		 * @param WP_Upgrader $upgrader  Upgrader instance.
+		 * @param array       $hook_extra Extra data: action, type, plugins/themes.
+		 * @return void
+		 */
+		public function auto_install_language_packs( $upgrader, array $hook_extra ): void {
+			if ( ( $hook_extra['type'] ?? '' ) !== 'plugin' ) {
+				return;
+			}
+
+			$action = $hook_extra['action'] ?? '';
+			if ( ! in_array( $action, array( 'install', 'update' ), true ) ) {
+				return;
+			}
+
+			// Collect basenames of affected plugins.
+			$affected = array();
+			if ( ! empty( $hook_extra['plugins'] ) ) {
+				$affected = (array) $hook_extra['plugins'];
+			} elseif ( ! empty( $hook_extra['plugin'] ) ) {
+				$affected = array( $hook_extra['plugin'] );
+			}
+
+			foreach ( $this->files as $file ) {
+				$basename = plugin_basename( $file );
+				if ( ! empty( $affected ) && ! in_array( $basename, $affected, true ) ) {
+					continue;
+				}
+
+				if ( ! file_exists( $file ) ) {
+					continue;
+				}
+
+				$plugin_data = get_plugin_data( $file, false, false );
+				$directory   = esc_url( $plugin_data['Directory'] ?? '' ) ?: esc_url( $plugin_data['PluginURI'] ?? '' );
+				$gh          = $directory ? $this->parse_github_url( $directory ) : null;
+				if ( ! $gh ) {
+					continue;
+				}
+
+				$releases = $this->get_github_releases( $gh['owner'], $gh['repo'] );
+				if ( ! $releases ) {
+					continue;
+				}
+
+				$installed_version  = $plugin_data['Version'] ?? '';
+				$lang_pattern       = '/^' . preg_quote( $gh['repo'], '/' ) . '\.([^-]+)-([a-z]{2,3}_[A-Z]{2,4})\.zip$/';
+				$installed_trans    = wp_get_installed_translations( 'plugins' )[ dirname( $basename ) ] ?? array();
+				$packs_to_install   = array();
+
+				foreach ( $releases as $release ) {
+					$release_version = ltrim( $release['tag_name'], 'v' );
+					foreach ( $release['assets'] ?? array() as $asset ) {
+						if ( ! preg_match( $lang_pattern, $asset['name'] ?? '', $m ) ) {
+							continue;
+						}
+						$asset_version = $m[1];
+						$locale        = $m[2];
+
+						if ( $installed_version && $asset_version !== $installed_version ) {
+							continue;
+						}
+						if ( isset( $packs_to_install[ $locale ] ) ) {
+							continue;
+						}
+
+						// Skip if already at this version.
+						$id_ver = $installed_trans[ $locale ]['Project-Id-Version'] ?? '';
+						if ( $id_ver && preg_match( '/([0-9]+\.[0-9]+\.[0-9]+)$/', $id_ver, $vm ) && $vm[1] === $asset_version ) {
+							continue;
+						}
+
+						$packs_to_install[ $locale ] = (object) array(
+							'type'     => 'plugin',
+							'slug'     => dirname( $basename ),
+							'language' => $locale,
+							'version'  => $release_version,
+							'updated'  => gmdate( 'Y-m-d H:i:s', strtotime( $release['published_at'] ) ),
+							'package'  => $asset['browser_download_url'],
+							'autoupdate' => true,
+						);
+					}
+				}
+
+				if ( empty( $packs_to_install ) ) {
+					continue;
+				}
+
+				require_once ABSPATH . 'wp-admin/includes/class-wp-upgrader.php';
+				require_once ABSPATH . 'wp-admin/includes/file.php';
+				require_once ABSPATH . 'wp-admin/includes/misc.php';
+
+				$skin     = new Automatic_Upgrader_Skin();
+				$lang_upgrader = new Language_Pack_Upgrader( $skin );
+				foreach ( $packs_to_install as $pack ) {
+					$lang_upgrader->upgrade( $pack );
+				}
+			}
 		}
 
 		/**
