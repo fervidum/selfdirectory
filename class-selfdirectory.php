@@ -30,7 +30,7 @@ if ( ! class_exists( 'SelfDirectory' ) ) {
 		 * @since 1.0.0
 		 * @var   string
 		 */
-		public $version = '1.2.0';
+		public $version = '1.2.1';
 
 		/**
 		 * Singleton instance.
@@ -196,7 +196,7 @@ if ( ! class_exists( 'SelfDirectory' ) ) {
 				array(
 					'headers' => array(
 						'Accept'     => 'application/vnd.github+json',
-						'User-Agent' => 'SelfDirectory/1.2.0 WordPress/' . get_bloginfo( 'version' ),
+						'User-Agent' => 'SelfDirectory/1.2.1 WordPress/' . get_bloginfo( 'version' ),
 					),
 					'timeout' => 10,
 				)
@@ -258,7 +258,7 @@ if ( ! class_exists( 'SelfDirectory' ) ) {
 				"https://raw.githubusercontent.com/{$owner}/{$repo}/{$tag}/{$plugin_basename}",
 				array(
 					'headers' => array(
-						'User-Agent' => 'SelfDirectory/1.2.0 WordPress/' . get_bloginfo( 'version' ),
+						'User-Agent' => 'SelfDirectory/1.2.1 WordPress/' . get_bloginfo( 'version' ),
 					),
 					'timeout' => 10,
 				)
