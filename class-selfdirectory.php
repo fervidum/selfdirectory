@@ -97,8 +97,12 @@ if ( ! class_exists( 'SelfDirectory' ) ) {
 			}
 			do_action( 'selfd_register' );
 
-			// translations_api runs in all contexts (WP-CLI, REST, cron, admin).
+			// plugins_api and translations_api run in all contexts (WP-CLI, REST, cron, admin).
+			add_filter( 'plugins_api', array( $this, 'plugins_api' ), 10, 3 );
 			add_filter( 'translations_api', array( $this, 'translations_api' ), 10, 3 );
+			// Redirect WP-CLI reconstructed download URLs to GitHub release assets.
+			add_filter( 'http_request_args', array( $this, 'http_follow_github_redirects' ), 10, 2 );
+			add_filter( 'pre_http_request', array( $this, 'pre_http_request_rewrite' ), 10, 3 );
 
 			if ( true !== $should_load ) {
 				return;
@@ -590,6 +594,188 @@ if ( ! class_exists( 'SelfDirectory' ) ) {
 				}
 				$value->translations[] = $pack;
 			}
+		}
+
+		/**
+		 * Redirect WP-CLI version-specific download URLs to GitHub release assets.
+		 *
+		 * WP-CLI calls alter_api_response() which reconstructs the download URL as
+		 * {base}{slug}.{version}.zip (wordpress.org pattern). For self-hosted plugins
+		 * this produces an invalid URL. This filter intercepts both the HEAD check
+		 * and the actual download, replacing the malformed URL with the correct
+		 * GitHub release asset URL when a matching version exists in our releases.
+		 *
+		 * Also ensures GitHub URLs follow redirects (GitHub assets return 302).
+		 *
+		 * @since 1.2.1
+		 * @param array  $args Parsed request args.
+		 * @param string $url  Request URL.
+		 * @return array
+		 */
+		public function http_follow_github_redirects( array $args, string $url ): array {
+			// GitHub release assets respond with 302 — ensure redirects are followed.
+			if ( strpos( $url, 'github.com' ) !== false ) {
+				$args['redirection'] = max( 5, $args['redirection'] ?? 5 );
+			}
+			return $args;
+		}
+
+		/**
+		 * Rewrite WP-CLI reconstructed download URLs to correct GitHub asset URLs.
+		 *
+		 * When WP-CLI calls alter_api_response() it rebuilds the download URL as
+		 * {base}{slug}.{version}.zip (wordpress.org pattern). For GitHub-hosted
+		 * plugins this produces a URL that returns 404. This filter intercepts both
+		 * the HEAD verification request and the actual download, transparently
+		 * replacing the malformed URL with the correct GitHub release asset URL.
+		 *
+		 * Returns false (let WordPress proceed) for everything except matched URLs,
+		 * where it performs the request against the correct URL instead.
+		 *
+		 * @since 1.2.1
+		 * @param false|array|WP_Error $preempt Whether to preempt the request.
+		 * @param array                $args    HTTP request args.
+		 * @param string               $url     Request URL.
+		 * @return false|array|WP_Error
+		 */
+		public function pre_http_request_rewrite( $preempt, array $args, string $url ) {
+			if ( false !== $preempt ) {
+				return $preempt;
+			}
+
+			foreach ( $this->files as $file ) {
+				$slug = dirname( plugin_basename( $file ) );
+				if ( ! preg_match( '/(?:^|\/)' . preg_quote( $slug, '/' ) . '\.([0-9]+\.[0-9]+\.[0-9]+)\.zip(?:[?#]|$)/', $url, $m ) ) {
+					continue;
+				}
+				$requested_version = $m[1];
+
+				$plugin_data = get_plugin_data( $file, false, false );
+				$directory   = esc_url( $plugin_data['Directory'] ?? '' ) ?: esc_url( $plugin_data['PluginURI'] ?? '' );
+				$gh          = $directory ? $this->parse_github_url( $directory ) : null;
+				if ( ! $gh ) {
+					continue;
+				}
+
+				// Only rewrite if the URL doesn't look like a valid GitHub release URL already.
+				if ( strpos( $url, 'github.com/' . $gh['owner'] . '/' . $gh['repo'] . '/releases/' ) !== false ) {
+					continue;
+				}
+
+				$releases = $this->get_github_releases( $gh['owner'], $gh['repo'] );
+				if ( ! $releases ) {
+					continue;
+				}
+
+				$lang_pattern = '/^' . preg_quote( $gh['repo'], '/' ) . '\.[^-]+-[a-z]{2,3}_[A-Z]{2,4}\.zip$/';
+				$asset_url    = null;
+				foreach ( $releases as $release ) {
+					if ( ltrim( $release['tag_name'], 'v' ) !== $requested_version ) {
+						continue;
+					}
+					foreach ( $release['assets'] ?? array() as $asset ) {
+						$name = $asset['name'] ?? '';
+						if ( str_ends_with( $name, '.zip' ) && ! preg_match( $lang_pattern, $name ) ) {
+							$asset_url = $asset['browser_download_url'];
+							break 2;
+						}
+					}
+				}
+
+				if ( ! $asset_url ) {
+					continue;
+				}
+
+				// Re-dispatch the request against the correct URL.
+				$args['redirection'] = max( 5, $args['redirection'] ?? 5 );
+				return wp_remote_request( $asset_url, $args );
+			}
+
+			return false;
+		}
+
+		/**
+		 * Intercept plugins_api() for registered plugins.
+		 *
+		 * Hooked on `plugins_api`. Returns plugin information including a `versions`
+		 * map built from GitHub releases, which enables:
+		 *   wp plugin install <slug> --version=<x.y.z> --force
+		 *
+		 * @since  1.2.1
+		 * @param  false|object|WP_Error $result Preemptive result; false = let WordPress proceed.
+		 * @param  string               $action API action (e.g. 'plugin_information').
+		 * @param  object               $args   Request args including slug.
+		 * @return false|object|WP_Error
+		 */
+		public function plugins_api( $result, $action, $args ) {
+			if ( 'plugin_information' !== $action ) {
+				return $result;
+			}
+
+			$slug = $args->slug ?? '';
+			if ( ! $slug ) {
+				return $result;
+			}
+
+			// Find the registered file matching this slug.
+			$file = null;
+			foreach ( $this->files as $f ) {
+				if ( dirname( plugin_basename( $f ) ) === $slug ) {
+					$file = $f;
+					break;
+				}
+			}
+			if ( ! $file ) {
+				return $result;
+			}
+
+			$plugin_data = get_plugin_data( $file, false, false );
+			$directory   = esc_url( $plugin_data['Directory'] ?? '' ) ?: esc_url( $plugin_data['PluginURI'] ?? '' );
+			$gh          = $directory ? $this->parse_github_url( $directory ) : null;
+			if ( ! $gh ) {
+				return $result;
+			}
+
+			$info = $this->get_update_via_github( $file, $gh );
+			if ( ! $info ) {
+				return $result;
+			}
+
+			// Build versions map: version => download_link (flat, as WP expects).
+			$versions = array();
+			foreach ( $info['versions'] ?? array() as $v => $vdata ) {
+				$versions[ $v ] = $vdata['package'] ?? '';
+			}
+			// Always include the latest version.
+			if ( ! isset( $versions[ $info['version'] ] ) ) {
+				$versions[ $info['version'] ] = $info['package'];
+			}
+
+			// If a specific version was requested (e.g. WP-CLI --version flag),
+			// resolve download_link to that version's package URL.
+			$requested = $args->version ?? '';
+			if ( $requested && isset( $versions[ $requested ] ) ) {
+				$download_link    = $versions[ $requested ];
+				$resolved_version = $requested;
+			} else {
+				$download_link    = $info['package'];
+				$resolved_version = $info['version'];
+			}
+
+			return (object) array(
+				'name'          => $plugin_data['Name'] ?? $slug,
+				'slug'          => $slug,
+				'version'       => $resolved_version,
+				'author'        => $plugin_data['Author'] ?? '',
+				'requires'      => $info['requires'],
+				'tested'        => $info['tested'],
+				'requires_php'  => $info['requires_php'],
+				'download_link' => $download_link,
+				'versions'      => $versions,
+				'sections'      => array(
+					'description' => $plugin_data['Description'] ?? '',
+				),
+			);
 		}
 
 		/**
