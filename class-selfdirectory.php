@@ -30,7 +30,7 @@ if ( ! class_exists( 'SelfDirectory' ) ) {
 		 * @since 1.0.0
 		 * @var   string
 		 */
-		public $version = '1.2.1';
+		public $version = '1.2.2';
 
 		/**
 		 * Singleton instance.
@@ -110,6 +110,34 @@ if ( ! class_exists( 'SelfDirectory' ) ) {
 
 			add_filter( 'pre_set_site_transient_update_plugins', array( $this, 'update_plugins' ) );
 			add_action( 'upgrader_process_complete', array( $this, 'auto_install_language_packs' ), 10, 2 );
+			// Flush GitHub caches when WordPress forces an update check (e.g. "Check again").
+			add_action( 'delete_site_transient_update_plugins', array( $this, 'flush_github_caches' ) );
+		}
+
+		/**
+		 * Flush all SelfDirectory GitHub caches.
+		 *
+		 * Triggered by `delete_site_transient_update_plugins` — which fires whenever
+		 * WordPress deletes the update_plugins transient (e.g. user clicks
+		 * "Check again" on the Updates screen). Deletes all `selfd_releases_*`
+		 * transients so the next update check hits the GitHub API fresh.
+		 *
+		 * Note: `selfd_headers_*` transients are intentionally kept — they cache
+		 * plugin headers from immutable Git tags and never need to be re-fetched.
+		 *
+		 * @since  1.2.2
+		 * @return void
+		 */
+		public function flush_github_caches() {
+			global $wpdb;
+			$rows = $wpdb->get_col(
+				"SELECT option_name FROM {$wpdb->options}
+				 WHERE option_name LIKE '_transient_selfd_releases_%'
+				    OR option_name LIKE '_transient_timeout_selfd_releases_%'"
+			);
+			foreach ( $rows as $row ) {
+				delete_option( $row );
+			}
 		}
 
 		/**
@@ -196,7 +224,7 @@ if ( ! class_exists( 'SelfDirectory' ) ) {
 				array(
 					'headers' => array(
 						'Accept'     => 'application/vnd.github+json',
-						'User-Agent' => 'SelfDirectory/1.2.1 WordPress/' . get_bloginfo( 'version' ),
+						'User-Agent' => 'SelfDirectory/1.2.2 WordPress/' . get_bloginfo( 'version' ),
 					),
 					'timeout' => 10,
 				)
@@ -258,7 +286,7 @@ if ( ! class_exists( 'SelfDirectory' ) ) {
 				"https://raw.githubusercontent.com/{$owner}/{$repo}/{$tag}/{$plugin_basename}",
 				array(
 					'headers' => array(
-						'User-Agent' => 'SelfDirectory/1.2.1 WordPress/' . get_bloginfo( 'version' ),
+						'User-Agent' => 'SelfDirectory/1.2.2 WordPress/' . get_bloginfo( 'version' ),
 					),
 					'timeout' => 10,
 				)
